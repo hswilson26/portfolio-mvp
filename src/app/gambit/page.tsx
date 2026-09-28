@@ -107,6 +107,7 @@ export default function DailyChessPage() {
   const [moveFeedback, setMoveFeedback] = useState<MoveFeedback | null>(null);
   const [copiedShare, setCopiedShare] = useState(false);
   const [showResults, setShowResults] = useState(false);
+  const [playUrl, setPlayUrl] = useState("");
   const [dragGhost, setDragGhost] = useState<{
     from: string;
     type: string;
@@ -231,6 +232,7 @@ export default function DailyChessPage() {
       month: (resumeUnsolved && lastDate ? lastDate : now).getMonth(),
     });
     setProgress(session.days);
+    setPlayUrl(`${window.location.origin}/gambit`);
     setMounted(true);
     persistReadyRef.current = true;
 
@@ -500,9 +502,7 @@ export default function DailyChessPage() {
         san,
         from,
         to,
-        message: isMate
-          ? "Checkmate. Look over the board — then your scorecard."
-          : "That's the solution. Look over the board — then your scorecard.",
+        message: isMate ? "Checkmate." : "Puzzle solved.",
       });
       completePuzzle(dayKey, SOLVE_REVEAL_MS);
       return;
@@ -678,7 +678,8 @@ export default function DailyChessPage() {
     ? `♟️ Daily Gambit — ${formatDisplayDate(selectedDate)}
 ${"♥".repeat(heartsLeft)}${"♡".repeat(STARTING_HEARTS - heartsLeft)}
 ⏱️ ${formatTime(dayStats.seconds)} · ${scoring.total} pts
-Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
+Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}
+Play it: ${playUrl || "/gambit"}`
     : "";
 
   const handleCopyShare = async () => {
@@ -873,6 +874,11 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
                       !isOpponentMoving &&
                       piece?.color === puzzle?.playerColor;
 
+                    const isSuccessHighlight =
+                      ((moveFeedback?.tone === "correct" || moveFeedback?.tone === "solved") &&
+                        isFeedbackMove) ||
+                      (isCompleted && isLast);
+
                     let squareBg = isDark ? "bg-[#b58863]" : "bg-[#f0d9b5]";
                     if (isSelected) squareBg = "bg-[#c6a046] ring-4 ring-[#5c3317] ring-inset";
                     else if (isDragOver && isLegal) squareBg = "bg-[#c6a046]/80";
@@ -880,14 +886,13 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
                       squareBg = isFeedbackTo
                         ? "bg-[#9b2c2c] ring-4 ring-[#f3e6c9]/40 ring-inset"
                         : "bg-[#7f1d1d]/90";
-                    } else if (moveFeedback?.tone === "solved" && isFeedbackMove) {
-                      squareBg = isFeedbackTo
-                        ? "bg-[#c6a046] ring-4 ring-[#fff8eb] ring-inset"
-                        : "bg-[#a07a32]";
-                    } else if (moveFeedback?.tone === "correct" && isFeedbackMove) {
-                      squareBg = isFeedbackTo
-                        ? "bg-[#3f7d4e] ring-4 ring-[#d7f0d4]/50 ring-inset"
-                        : "bg-[#2f5d3a]";
+                    } else if (isSuccessHighlight) {
+                      const isLanding =
+                        (moveFeedback && isFeedbackTo) ||
+                        (isCompleted && lastMove?.to === sq);
+                      squareBg = isLanding
+                        ? "bg-[#2d8a4a] ring-4 ring-[#e8f6e8]/50 ring-inset"
+                        : "bg-[#1d5c32]/90";
                     } else if (isLast) squareBg = isDark ? "bg-[#c0a06a]" : "bg-[#e6c27a]";
 
                     return (
@@ -945,6 +950,16 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
               </div>
             </div>
 
+            {isCompleted && !showResults && (
+              <button
+                type="button"
+                onClick={() => setShowResults(true)}
+                className="mt-4 w-full rounded-sm border-2 border-[#c6a046] bg-[#c6a046] px-4 py-3 text-base font-semibold tracking-wide text-[#2c2419] shadow-lg hover:bg-[#d4b056]"
+              >
+                View scorecard
+              </button>
+            )}
+
             <div
               role="status"
               aria-live="polite"
@@ -971,14 +986,16 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
                   this position.
                 </p>
               )}
-              <button
-                type="button"
-                onClick={resetBoardToStart}
-                disabled={isCompleted}
-                className="rounded border border-[#c6a046]/40 bg-[#173528] px-3 py-1.5 text-xs tracking-wide text-[#f3e6c9] hover:border-[#c6a046] disabled:opacity-40"
-              >
-                Reset board
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={resetBoardToStart}
+                  disabled={isCompleted}
+                  className="rounded border border-[#c6a046]/40 bg-[#173528] px-3 py-1.5 text-xs tracking-wide text-[#f3e6c9] hover:border-[#c6a046] disabled:opacity-40"
+                >
+                  Reset board
+                </button>
+              </div>
             </div>
             <p className="mt-2 text-[11px] leading-relaxed text-[#b8a888]">
               Resetting the board restores the starting position only. Time, hearts, and
@@ -997,6 +1014,15 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
               <p className="mt-2 font-mono text-5xl font-bold leading-none tracking-tight text-[#5c3317] sm:text-6xl">
                 {scoring?.total ?? "—"}
               </p>
+              {isCompleted && !showResults && (
+                <button
+                  type="button"
+                  onClick={() => setShowResults(true)}
+                  className="mt-4 w-full rounded-sm border-2 border-[#5c3317] bg-[#5c3317] px-4 py-3 text-sm font-semibold tracking-wide text-[#f3e6c9] hover:bg-[#7a4420]"
+                >
+                  View scorecard
+                </button>
+              )}
               <dl className="mt-5 space-y-2 text-sm">
                 <div className="flex justify-between">
                   <dt>Base ({puzzle ? `${puzzle.rating} Elo` : "—"})</dt>
@@ -1015,10 +1041,6 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
                   </dd>
                 </div>
               </dl>
-              <p className="mt-4 border-t border-[#c6a046]/40 pt-3 text-xs leading-relaxed text-[#5c4a32]">
-                Everyone gets the same position at local midnight. Five hearts. A wrong
-                legal move costs a heart, not the clock. Future dates stay locked.
-              </p>
             </section>
 
             <section className="rounded-sm border border-[#c6a046]/25 bg-[#0f241c] p-5">
@@ -1055,21 +1077,6 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
               ) : (
                 <p className="mt-3 text-sm text-[#d7c7a4]">No puzzle for this date.</p>
               )}
-            </section>
-
-            <section className="rounded-sm border border-[#c6a046]/20 bg-[#173528]/80 p-5 text-sm leading-relaxed text-[#d7c7a4]">
-              <h2
-                className="text-sm uppercase tracking-[0.18em] text-[#c6a046]"
-                style={{ fontFamily: "var(--font-chess-display), Georgia, serif" }}
-              >
-                How the daily works
-              </h2>
-              <p className="mt-3">
-                One tactic a day, same for every visitor — the Chess.com Daily Puzzle
-                model. Open the date to browse the archive; only today and past days
-                unlock. Positions come from the public Lichess puzzle database, not
-                hand-built mates.
-              </p>
             </section>
           </aside>
         </div>
@@ -1248,6 +1255,11 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
               >
                 {copiedShare ? "Copied scorecard" : "Copy scorecard"}
               </button>
+              {playUrl && (
+                <p className="text-xs text-[#5c4a32]">
+                  Includes {playUrl}
+                </p>
+              )}
               <button
                 type="button"
                 onClick={() => setShowResults(false)}
