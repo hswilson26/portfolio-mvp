@@ -18,7 +18,7 @@ export const projects: Project[] = [
       "One verified chess tactic each day in the Chess.com Daily Puzzle style: a calendar of today and past dates, hearts and a live clock that never resets on retry, and positions sourced from the Lichess public puzzle archive.",
     techStack: ["Next.js", "React 19", "chess.js", "Lichess Puzzles", "Tailwind CSS"],
     status: "Live",
-    demoUrl: "/chess",
+    demoUrl: "/gambit",
     githubUrl: "https://github.com/hswil/daily-gambit",
   },
   {
