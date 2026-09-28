@@ -54,6 +54,16 @@ const baskerville = Libre_Baskerville({
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const FILES = ["a", "b", "c", "d", "e", "f", "g", "h"] as const;
+const SOLVE_REVEAL_MS = 1800;
+const OPPONENT_REPLY_MS = 700;
+
+type MoveFeedback = {
+  tone: "wrong" | "correct" | "solved";
+  san: string;
+  from: string;
+  to: string;
+  message: string;
+};
 
 function playSound(freq: number, type: OscillatorType = "sine", duration = 0.12) {
   try {
@@ -94,7 +104,7 @@ export default function DailyChessPage() {
   const [lastMove, setLastMove] = useState<{ from: string; to: string } | null>(null);
   const [shakeSquare, setShakeSquare] = useState<string | null>(null);
   const [isOpponentMoving, setIsOpponentMoving] = useState(false);
-  const [coachNote, setCoachNote] = useState<string | null>(null);
+  const [moveFeedback, setMoveFeedback] = useState<MoveFeedback | null>(null);
   const [copiedShare, setCopiedShare] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const [dragGhost, setDragGhost] = useState<{
@@ -114,6 +124,7 @@ export default function DailyChessPage() {
   const lastMoveRef = useRef<{ from: string; to: string } | null>(null);
   const persistReadyRef = useRef(false);
   const selectedKeyRef = useRef<string | null>(null);
+  const resultsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragStartRef = useRef<{
     from: string;
     type: string;
@@ -180,7 +191,7 @@ export default function DailyChessPage() {
     setLastMove(puzzle.lastMove);
     setShakeSquare(null);
     setIsOpponentMoving(false);
-    setCoachNote(null);
+    setMoveFeedback(null);
     setDragGhost(null);
     dragStartRef.current = null;
     dragMovedRef.current = false;
@@ -285,12 +296,16 @@ export default function DailyChessPage() {
     setSelectedSquare(null);
     setShakeSquare(null);
     setIsOpponentMoving(false);
-    setCoachNote(null);
+    setMoveFeedback(null);
     setDragGhost(null);
     dragStartRef.current = null;
     dragMovedRef.current = false;
     setShowResults(alreadySolved);
     setCopiedShare(false);
+    if (resultsTimerRef.current) {
+      window.clearTimeout(resultsTimerRef.current);
+      resultsTimerRef.current = null;
+    }
     // Timer and mistake counts live in `progress` and must not reset here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [puzzle?.id, selectedKey]);
@@ -324,6 +339,12 @@ export default function DailyChessPage() {
     };
   }, [mounted, selectedKey, isCompleted]);
 
+  useEffect(() => {
+    return () => {
+      if (resultsTimerRef.current) window.clearTimeout(resultsTimerRef.current);
+    };
+  }, []);
+
   const selectDate = (key: string) => {
     if (!todayDate) return;
     const next = parseDateKey(key);
@@ -343,37 +364,52 @@ export default function DailyChessPage() {
     [selectedKey],
   );
 
-  const completePuzzle = useCallback(() => {
-    if (!selectedKey) return;
+  const completePuzzle = useCallback((dayKey: string, revealDelayMs: number) => {
     const snapshot: BoardSnapshot = {
       fen: gameFenRef.current ?? "",
       solutionIndex: solutionIndexRef.current,
       lastMove: lastMoveRef.current,
     };
     setProgress((prev) => {
-      const current = prev[selectedKey] ?? emptyProgress();
+      const current = prev[dayKey] ?? emptyProgress();
       return {
         ...prev,
-        [selectedKey]: {
+        [dayKey]: {
           ...current,
           completed: true,
           board: snapshot.fen ? snapshot : current.board,
         },
       };
     });
-    setShowResults(true);
     playSound(784, "triangle", 0.28);
-  }, [selectedKey]);
+    window.setTimeout(() => playSound(988, "triangle", 0.22), 140);
+    if (resultsTimerRef.current) window.clearTimeout(resultsTimerRef.current);
+    if (revealDelayMs <= 0) {
+      setShowResults(true);
+      return;
+    }
+    resultsTimerRef.current = window.setTimeout(() => {
+      resultsTimerRef.current = null;
+      if (selectedKeyRef.current !== dayKey) return;
+      setShowResults(true);
+    }, revealDelayMs);
+  }, []);
 
-  const registerMistake = (square: string) => {
+  const registerMistake = (from: string, to: string, san: string) => {
     if (!selectedKey) return;
     setProgress((prev) => {
       const current = prev[selectedKey] ?? emptyProgress();
       return { ...prev, [selectedKey]: { ...current, mistakes: current.mistakes + 1 } };
     });
-    setShakeSquare(square);
-    setTimeout(() => setShakeSquare(null), 450);
-    setCoachNote("A legal try, but not the winning idea. The clock keeps running.");
+    setShakeSquare(to);
+    setTimeout(() => setShakeSquare(null), 500);
+    setMoveFeedback({
+      tone: "wrong",
+      san,
+      from,
+      to,
+      message: "Legal, but not the winning idea. You lose a heart; the clock keeps running.",
+    });
     playSound(196, "sawtooth", 0.12);
     setSelectedSquare(null);
   };
@@ -406,6 +442,16 @@ export default function DailyChessPage() {
     if (!candidate) {
       selectedSquareRef.current = null;
       setSelectedSquare(null);
+      setMoveFeedback({
+        tone: "wrong",
+        san: `${from}→${to}`,
+        from,
+        to,
+        message: `${from} to ${to} is not legal from this position.`,
+      });
+      setShakeSquare(to);
+      window.setTimeout(() => setShakeSquare(null), 450);
+      playSound(160, "square", 0.08);
       return;
     }
 
@@ -419,10 +465,12 @@ export default function DailyChessPage() {
     });
     const isMate = probe.isCheckmate();
     const isCorrect = playedUci === expected || (puzzle.isMateInOne && isMate);
+    const san = candidate.san || `${from}→${to}`;
+    const opponentName = puzzle.playerColor === "w" ? "Black" : "White";
 
     if (!isCorrect) {
       selectedSquareRef.current = null;
-      registerMistake(from);
+      registerMistake(from, to, san);
       return;
     }
 
@@ -436,7 +484,6 @@ export default function DailyChessPage() {
     setLastMove(playerLast);
     setSolutionIndex(solutionIndexRef.current);
     setSelectedSquare(null);
-    setCoachNote(null);
     persistBoard(
       {
         fen: probe.fen(),
@@ -448,9 +495,26 @@ export default function DailyChessPage() {
 
     const opponentUci = puzzle.solution[solutionIndexRef.current];
     if (!opponentUci) {
-      completePuzzle();
+      setMoveFeedback({
+        tone: "solved",
+        san,
+        from,
+        to,
+        message: isMate
+          ? "Checkmate. Look over the board — then your scorecard."
+          : "That's the solution. Look over the board — then your scorecard.",
+      });
+      completePuzzle(dayKey, SOLVE_REVEAL_MS);
       return;
     }
+
+    setMoveFeedback({
+      tone: "correct",
+      san,
+      from,
+      to,
+      message: `That's the idea. ${opponentName} has to reply.`,
+    });
 
     const afterPlayerIndex = solutionIndexRef.current;
     setIsOpponentMoving(true);
@@ -461,7 +525,7 @@ export default function DailyChessPage() {
         to: opponentUci.slice(2, 4) as Square,
         promotion: opponentUci[4],
       };
-      replyGame.move(parts);
+      const reply = replyGame.move(parts);
       const replyLast = { from: parts.from, to: parts.to };
       const afterOppIndex = afterPlayerIndex + 1;
       persistBoard(
@@ -481,7 +545,15 @@ export default function DailyChessPage() {
       setSolutionIndex(afterOppIndex);
       playSound(330, "sine", 0.12);
       setIsOpponentMoving(false);
-    }, 520);
+      const replySan = reply?.san ? ` ${reply.san}` : "";
+      setMoveFeedback({
+        tone: "correct",
+        san,
+        from,
+        to,
+        message: `It stood up. ${opponentName} played${replySan}. Your turn — finish it.`,
+      });
+    }, OPPONENT_REPLY_MS);
   };
 
   const handlePiecePointerDown = (
@@ -755,7 +827,7 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
         <div className="grid items-start gap-8 lg:grid-cols-12">
           <div className="lg:col-span-7">
             <div
-              className={`rounded-sm border-[10px] border-[#5c3317] bg-[#3d2212] p-3 shadow-[0_20px_50px_rgba(0,0,0,0.45)] ${
+              className={`relative rounded-sm border-[10px] border-[#5c3317] bg-[#3d2212] p-3 shadow-[0_20px_50px_rgba(0,0,0,0.45)] ${
                 isCompleted
                   ? "ring-4 ring-[#c6a046]/70"
                   : turnIsWhite
@@ -771,6 +843,16 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
                   compact
                 />
               </div>
+              {moveFeedback?.tone === "solved" && !showResults && (
+                <div className="mb-2 rounded-sm border-2 border-[#c6a046] bg-[#0f241c] px-4 py-2 text-center">
+                  <p className="font-mono text-2xl font-bold tracking-wide text-[#f0d48a]">
+                    {moveFeedback.san}
+                  </p>
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.28em] text-[#c6a046]">
+                    {moveFeedback.san.includes("#") ? "Checkmate" : "Puzzle solved"}
+                  </p>
+                </div>
+              )}
               <div className="grid aspect-square grid-cols-8 grid-rows-8 overflow-hidden rounded-sm border-2 border-[#2a170c] shadow-inner [grid-template-rows:repeat(8,minmax(0,1fr))] [grid-template-columns:repeat(8,minmax(0,1fr))]">
                 {ranks.map((rank, rIdx) =>
                   files.map((file, fIdx) => {
@@ -780,6 +862,9 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
                     const isSelected = selectedSquare === sq;
                     const isLast = lastMove?.from === sq || lastMove?.to === sq;
                     const isLegal = legalDestinationSquares.has(sq);
+                    const isFeedbackFrom = moveFeedback?.from === sq;
+                    const isFeedbackTo = moveFeedback?.to === sq;
+                    const isFeedbackMove = Boolean(moveFeedback && (isFeedbackFrom || isFeedbackTo));
 
                     const isDragOver = dragGhost?.over === sq && dragGhost.from !== sq;
                     const canDrag =
@@ -791,7 +876,19 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
                     let squareBg = isDark ? "bg-[#b58863]" : "bg-[#f0d9b5]";
                     if (isSelected) squareBg = "bg-[#c6a046] ring-4 ring-[#5c3317] ring-inset";
                     else if (isDragOver && isLegal) squareBg = "bg-[#c6a046]/80";
-                    else if (isLast) squareBg = isDark ? "bg-[#c0a06a]" : "bg-[#e6c27a]";
+                    else if (moveFeedback?.tone === "wrong" && isFeedbackMove) {
+                      squareBg = isFeedbackTo
+                        ? "bg-[#9b2c2c] ring-4 ring-[#f3e6c9]/40 ring-inset"
+                        : "bg-[#7f1d1d]/90";
+                    } else if (moveFeedback?.tone === "solved" && isFeedbackMove) {
+                      squareBg = isFeedbackTo
+                        ? "bg-[#c6a046] ring-4 ring-[#fff8eb] ring-inset"
+                        : "bg-[#a07a32]";
+                    } else if (moveFeedback?.tone === "correct" && isFeedbackMove) {
+                      squareBg = isFeedbackTo
+                        ? "bg-[#3f7d4e] ring-4 ring-[#d7f0d4]/50 ring-inset"
+                        : "bg-[#2f5d3a]";
+                    } else if (isLast) squareBg = isDark ? "bg-[#c0a06a]" : "bg-[#e6c27a]";
 
                     return (
                       <button
@@ -848,15 +945,37 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
               </div>
             </div>
 
-            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-[#d7c7a4]">
-              <p className="italic">
-                {coachNote ??
-                  "Select a piece, or drag it. Dots appear only on moves that are legal in this position."}
-              </p>
+            <div
+              role="status"
+              aria-live="polite"
+              className={`mt-4 flex flex-wrap items-center justify-between gap-3 rounded-sm border px-3 py-2.5 text-sm ${
+                moveFeedback?.tone === "wrong"
+                  ? "border-[#c45c4a]/70 bg-[#3a1512] text-[#f6d5d0]"
+                  : moveFeedback?.tone === "solved"
+                    ? "border-[#c6a046] bg-[#173528] text-[#f6ead0]"
+                    : moveFeedback?.tone === "correct"
+                      ? "border-[#4d8a5c]/80 bg-[#143326] text-[#d7f0d4]"
+                      : "border-transparent text-[#d7c7a4]"
+              }`}
+            >
+              {moveFeedback ? (
+                <p>
+                  <span className="mr-2 font-mono text-base font-bold tracking-wide">
+                    {moveFeedback.tone === "wrong" ? "✗" : "✓"} {moveFeedback.san}
+                  </span>
+                  {moveFeedback.message}
+                </p>
+              ) : (
+                <p className="italic">
+                  Select a piece, or drag it. Dots appear only on moves that are legal in
+                  this position.
+                </p>
+              )}
               <button
                 type="button"
                 onClick={resetBoardToStart}
-                className="rounded border border-[#c6a046]/40 bg-[#173528] px-3 py-1.5 text-xs tracking-wide text-[#f3e6c9] hover:border-[#c6a046]"
+                disabled={isCompleted}
+                className="rounded border border-[#c6a046]/40 bg-[#173528] px-3 py-1.5 text-xs tracking-wide text-[#f3e6c9] hover:border-[#c6a046] disabled:opacity-40"
               >
                 Reset board
               </button>
