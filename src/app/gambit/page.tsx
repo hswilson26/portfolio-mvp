@@ -9,7 +9,6 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import Link from "next/link";
 import { Chess, type Square } from "chess.js";
 import { Libre_Baskerville, Playfair_Display } from "next/font/google";
 import { ChessPieceSvg } from "@/components/chess-piece";
@@ -24,18 +23,20 @@ import {
   formatTime,
   getPuzzleForDate,
   heartsRemaining,
-  loadProgress,
+  loadSession,
   monthGrid,
   parseDateKey,
   primaryTheme,
   resolvePuzzle,
-  saveProgress,
+  saveSession,
+  STORAGE_VERSION,
   scoreBreakdown,
   shiftDateKey,
   mostRecentUnsolvedKey,
   themeLabel,
   toDateKey,
   verifyArchive,
+  type BoardSnapshot,
   type DayProgress,
 } from "@/lib/daily-puzzle";
 
@@ -110,6 +111,9 @@ export default function DailyChessPage() {
   const selectedSquareRef = useRef<string | null>(null);
   const solutionIndexRef = useRef(0);
   const gameFenRef = useRef<string | null>(null);
+  const lastMoveRef = useRef<{ from: string; to: string } | null>(null);
+  const persistReadyRef = useRef(false);
+  const selectedKeyRef = useRef<string | null>(null);
   const dragStartRef = useRef<{
     from: string;
     type: string;
@@ -126,6 +130,8 @@ export default function DailyChessPage() {
   selectedSquareRef.current = selectedSquare;
   solutionIndexRef.current = solutionIndex;
   gameFenRef.current = gameFen;
+  lastMoveRef.current = lastMove;
+  selectedKeyRef.current = selectedKey;
 
   const selectedDate = selectedKey ? parseDateKey(selectedKey) : null;
   const todayDate = todayKey ? parseDateKey(todayKey) : null;
@@ -163,10 +169,11 @@ export default function DailyChessPage() {
   }, [legalMovesForSelected]);
 
   const resetBoardToStart = useCallback(() => {
-    if (!puzzle) return;
+    if (!puzzle || !selectedKey) return;
     selectedSquareRef.current = null;
     solutionIndexRef.current = 0;
     gameFenRef.current = puzzle.fen;
+    lastMoveRef.current = puzzle.lastMove;
     setGameFen(puzzle.fen);
     setSolutionIndex(0);
     setSelectedSquare(null);
@@ -177,17 +184,44 @@ export default function DailyChessPage() {
     setDragGhost(null);
     dragStartRef.current = null;
     dragMovedRef.current = false;
+    setProgress((prev) => {
+      const current = prev[selectedKey] ?? emptyProgress();
+      return {
+        ...prev,
+        [selectedKey]: {
+          ...current,
+          board: {
+            fen: puzzle.fen,
+            solutionIndex: 0,
+            lastMove: puzzle.lastMove,
+          },
+        },
+      };
+    });
     playSound(260, "sine", 0.08);
-  }, [puzzle]);
+  }, [puzzle, selectedKey]);
 
   useEffect(() => {
     const now = new Date();
     const key = toDateKey(now);
+    const session = loadSession();
+    const lastKey = session.lastSelectedKey;
+    const lastDate = lastKey ? parseDateKey(lastKey) : null;
+    const resumeUnsolved =
+      lastKey &&
+      lastDate &&
+      canAccessDate(lastDate, now) &&
+      !session.days[lastKey]?.completed;
+
     setTodayKey(key);
-    setSelectedKey(key);
-    setCalendarCursor({ year: now.getFullYear(), month: now.getMonth() });
-    setProgress(loadProgress());
+    setSelectedKey(resumeUnsolved ? lastKey : key);
+    setCalendarCursor({
+      year: (resumeUnsolved && lastDate ? lastDate : now).getFullYear(),
+      month: (resumeUnsolved && lastDate ? lastDate : now).getMonth(),
+    });
+    setProgress(session.days);
     setMounted(true);
+    persistReadyRef.current = true;
 
     if (process.env.NODE_ENV === "development") {
       const errors = verifyArchive();
@@ -197,7 +231,8 @@ export default function DailyChessPage() {
 
   useEffect(() => {
     if (!puzzle) return;
-    const alreadySolved = Boolean(progress[selectedKey ?? ""]?.completed);
+    const stats = selectedKey ? progress[selectedKey] : undefined;
+    const alreadySolved = Boolean(stats?.completed);
     if (alreadySolved) {
       const finished = new Chess(puzzle.fen);
       for (const uci of puzzle.solution) {
@@ -208,21 +243,43 @@ export default function DailyChessPage() {
         });
       }
       const finale = puzzle.solution.at(-1);
+      const last = finale
+        ? { from: finale.slice(0, 2), to: finale.slice(2, 4) }
+        : puzzle.lastMove;
       gameFenRef.current = finished.fen();
       solutionIndexRef.current = puzzle.solution.length;
+      lastMoveRef.current = last;
       setGameFen(finished.fen());
       setSolutionIndex(puzzle.solution.length);
-      setLastMove(
-        finale
-          ? { from: finale.slice(0, 2), to: finale.slice(2, 4) }
-          : puzzle.lastMove,
-      );
+      setLastMove(last);
     } else {
-      gameFenRef.current = puzzle.fen;
-      solutionIndexRef.current = 0;
-      setGameFen(puzzle.fen);
-      setSolutionIndex(0);
-      setLastMove(puzzle.lastMove);
+      let fen = stats?.board?.fen ?? puzzle.fen;
+      let idx = stats?.board?.solutionIndex ?? 0;
+      let last = stats?.board?.lastMove ?? puzzle.lastMove;
+      try {
+        const restored = new Chess(fen);
+        if (idx % 2 === 1 && puzzle.solution[idx]) {
+          const uci = puzzle.solution[idx];
+          restored.move({
+            from: uci.slice(0, 2),
+            to: uci.slice(2, 4),
+            promotion: uci[4],
+          });
+          fen = restored.fen();
+          idx += 1;
+          last = { from: uci.slice(0, 2), to: uci.slice(2, 4) };
+        }
+      } catch {
+        fen = puzzle.fen;
+        idx = 0;
+        last = puzzle.lastMove;
+      }
+      gameFenRef.current = fen;
+      solutionIndexRef.current = idx;
+      lastMoveRef.current = last;
+      setGameFen(fen);
+      setSolutionIndex(idx);
+      setLastMove(last);
     }
     selectedSquareRef.current = null;
     setSelectedSquare(null);
@@ -239,9 +296,13 @@ export default function DailyChessPage() {
   }, [puzzle?.id, selectedKey]);
 
   useEffect(() => {
-    if (!mounted) return;
-    saveProgress(progress);
-  }, [progress, mounted]);
+    if (!mounted || !persistReadyRef.current) return;
+    saveSession({
+      version: STORAGE_VERSION,
+      lastSelectedKey: selectedKey,
+      days: progress,
+    });
+  }, [progress, selectedKey, mounted]);
 
   useEffect(() => {
     if (!mounted || !selectedKey || isCompleted) {
@@ -271,11 +332,34 @@ export default function DailyChessPage() {
     setCalendarOpen(false);
   };
 
+  const persistBoard = useCallback(
+    (snapshot: BoardSnapshot, dayKey: string | null = selectedKey) => {
+      if (!dayKey) return;
+      setProgress((prev) => {
+        const current = prev[dayKey] ?? emptyProgress();
+        return { ...prev, [dayKey]: { ...current, board: snapshot } };
+      });
+    },
+    [selectedKey],
+  );
+
   const completePuzzle = useCallback(() => {
     if (!selectedKey) return;
+    const snapshot: BoardSnapshot = {
+      fen: gameFenRef.current ?? "",
+      solutionIndex: solutionIndexRef.current,
+      lastMove: lastMoveRef.current,
+    };
     setProgress((prev) => {
       const current = prev[selectedKey] ?? emptyProgress();
-      return { ...prev, [selectedKey]: { ...current, completed: true } };
+      return {
+        ...prev,
+        [selectedKey]: {
+          ...current,
+          completed: true,
+          board: snapshot.fen ? snapshot : current.board,
+        },
+      };
     });
     setShowResults(true);
     playSound(784, "triangle", 0.28);
@@ -309,8 +393,9 @@ export default function DailyChessPage() {
   };
 
   const playUserMove = (from: string, to: string) => {
-    if (!puzzle || isCompleted || isOpponentMoving) return;
+    if (!puzzle || isCompleted || isOpponentMoving || !selectedKey) return;
     if (from === to) return;
+    const dayKey = selectedKey;
 
     const board = new Chess(gameFenRef.current ?? puzzle.fen);
     const legalFrom = board.moves({
@@ -343,18 +428,31 @@ export default function DailyChessPage() {
 
     playSound(659.25, "sine", 0.14);
     selectedSquareRef.current = null;
+    const playerLast = { from: candidate.from, to: candidate.to };
     gameFenRef.current = probe.fen();
+    lastMoveRef.current = playerLast;
+    solutionIndexRef.current += 1;
     setGameFen(probe.fen());
-    setLastMove({ from: candidate.from, to: candidate.to });
+    setLastMove(playerLast);
+    setSolutionIndex(solutionIndexRef.current);
     setSelectedSquare(null);
     setCoachNote(null);
+    persistBoard(
+      {
+        fen: probe.fen(),
+        solutionIndex: solutionIndexRef.current,
+        lastMove: playerLast,
+      },
+      dayKey,
+    );
 
-    const opponentUci = puzzle.solution[solutionIndexRef.current + 1];
+    const opponentUci = puzzle.solution[solutionIndexRef.current];
     if (!opponentUci) {
       completePuzzle();
       return;
     }
 
+    const afterPlayerIndex = solutionIndexRef.current;
     setIsOpponentMoving(true);
     window.setTimeout(() => {
       const replyGame = new Chess(probe.fen());
@@ -364,12 +462,24 @@ export default function DailyChessPage() {
         promotion: opponentUci[4],
       };
       replyGame.move(parts);
+      const replyLast = { from: parts.from, to: parts.to };
+      const afterOppIndex = afterPlayerIndex + 1;
+      persistBoard(
+        {
+          fen: replyGame.fen(),
+          solutionIndex: afterOppIndex,
+          lastMove: replyLast,
+        },
+        dayKey,
+      );
+      if (selectedKeyRef.current !== dayKey) return;
       gameFenRef.current = replyGame.fen();
+      lastMoveRef.current = replyLast;
+      solutionIndexRef.current = afterOppIndex;
       setGameFen(replyGame.fen());
-      setLastMove({ from: parts.from, to: parts.to });
+      setLastMove(replyLast);
+      setSolutionIndex(afterOppIndex);
       playSound(330, "sine", 0.12);
-      solutionIndexRef.current += 2;
-      setSolutionIndex((idx) => idx + 2);
       setIsOpponentMoving(false);
     }, 520);
   };
@@ -540,23 +650,14 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
 
       <header className="relative z-10 border-b border-[#c6a046]/25 bg-[#0f241c]/95 px-4 py-3 backdrop-blur-md sm:px-8">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <Link
-              href="/"
-              className="rounded border border-[#c6a046]/30 bg-[#173528] px-3 py-1.5 text-xs tracking-wide text-[#e6d5b0] transition hover:border-[#c6a046] hover:text-[#fff8e8]"
+          <div className="flex items-center gap-2">
+            <span className="text-xl text-[#c6a046]">♞</span>
+            <span
+              className="text-lg tracking-tight text-[#f6ead0] sm:text-xl"
+              style={{ fontFamily: "var(--font-chess-display), Georgia, serif" }}
             >
-              ← Portfolio
-            </Link>
-            <div className="hidden h-4 w-px bg-[#c6a046]/30 sm:block" />
-            <div className="flex items-center gap-2">
-              <span className="text-xl text-[#c6a046]">♞</span>
-              <span
-                className="text-lg tracking-tight text-[#f6ead0] sm:text-xl"
-                style={{ fontFamily: "var(--font-chess-display), Georgia, serif" }}
-              >
-                Daily Gambit
-              </span>
-            </div>
+              Daily Gambit
+            </span>
           </div>
 
           <div className="flex items-center gap-2 sm:gap-3">

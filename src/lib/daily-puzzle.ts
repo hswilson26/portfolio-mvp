@@ -7,6 +7,7 @@ import {
 
 export const STARTING_HEARTS = 5;
 export const STORAGE_KEY = "daily-gambit-v2";
+export const STORAGE_VERSION = 3;
 export const BASE_POINTS = 1000;
 export const TIME_PENALTY_PER_SEC = 2;
 export const MISTAKE_PENALTY = 150;
@@ -43,10 +44,23 @@ const THEME_LABELS: Record<string, string> = {
   long: "Long",
 };
 
+export interface BoardSnapshot {
+  fen: string;
+  solutionIndex: number;
+  lastMove: { from: string; to: string } | null;
+}
+
 export interface DayProgress {
   seconds: number;
   mistakes: number;
   completed: boolean;
+  board?: BoardSnapshot | null;
+}
+
+export interface GambitSession {
+  version: number;
+  lastSelectedKey: string | null;
+  days: Record<string, DayProgress>;
 }
 
 export interface ResolvedPuzzle {
@@ -63,7 +77,11 @@ export interface ResolvedPuzzle {
 }
 
 export function emptyProgress(): DayProgress {
-  return { seconds: 0, mistakes: 0, completed: false };
+  return { seconds: 0, mistakes: 0, completed: false, board: null };
+}
+
+export function emptySession(): GambitSession {
+  return { version: STORAGE_VERSION, lastSelectedKey: null, days: {} };
 }
 
 export function pad2(n: number): string {
@@ -233,21 +251,101 @@ export function currentStreak(progress: Record<string, DayProgress>, todayKey: s
   return streak;
 }
 
-export function loadProgress(): Record<string, DayProgress> {
-  if (typeof window === "undefined") return {};
+function sanitizeLastMove(value: unknown): { from: string; to: string } | null {
+  if (!value || typeof value !== "object") return null;
+  const from = (value as { from?: unknown }).from;
+  const to = (value as { to?: unknown }).to;
+  if (typeof from !== "string" || typeof to !== "string") return null;
+  return { from, to };
+}
+
+function sanitizeBoard(value: unknown): BoardSnapshot | null {
+  if (!value || typeof value !== "object") return null;
+  const fen = (value as { fen?: unknown }).fen;
+  const solutionIndex = (value as { solutionIndex?: unknown }).solutionIndex;
+  if (typeof fen !== "string" || typeof solutionIndex !== "number" || !Number.isFinite(solutionIndex)) {
+    return null;
+  }
+  return {
+    fen,
+    solutionIndex: Math.max(0, Math.floor(solutionIndex)),
+    lastMove: sanitizeLastMove((value as { lastMove?: unknown }).lastMove),
+  };
+}
+
+function sanitizeDay(value: unknown): DayProgress {
+  if (!value || typeof value !== "object") return emptyProgress();
+  const seconds = (value as { seconds?: unknown }).seconds;
+  const mistakes = (value as { mistakes?: unknown }).mistakes;
+  const completed = (value as { completed?: unknown }).completed;
+  return {
+    seconds: typeof seconds === "number" && Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0,
+    mistakes: typeof mistakes === "number" && Number.isFinite(mistakes) ? Math.max(0, Math.floor(mistakes)) : 0,
+    completed: completed === true,
+    board: sanitizeBoard((value as { board?: unknown }).board),
+  };
+}
+
+function sanitizeDays(value: unknown): Record<string, DayProgress> {
+  if (!value || typeof value !== "object") return {};
+  const days: Record<string, DayProgress> = {};
+  for (const [key, day] of Object.entries(value as Record<string, unknown>)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) continue;
+    days[key] = sanitizeDay(day);
+  }
+  return days;
+}
+
+export function loadSession(): GambitSession {
+  if (typeof window === "undefined") return emptySession();
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as Record<string, DayProgress>;
-    return parsed && typeof parsed === "object" ? parsed : {};
+    if (!raw) return emptySession();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return emptySession();
+
+    const record = parsed as Record<string, unknown>;
+    if (record.version === STORAGE_VERSION && record.days && typeof record.days === "object") {
+      return {
+        version: STORAGE_VERSION,
+        lastSelectedKey: typeof record.lastSelectedKey === "string" ? record.lastSelectedKey : null,
+        days: sanitizeDays(record.days),
+      };
+    }
+
+    return {
+      version: STORAGE_VERSION,
+      lastSelectedKey: null,
+      days: sanitizeDays(parsed),
+    };
   } catch {
-    return {};
+    return emptySession();
   }
 }
 
-export function saveProgress(progress: Record<string, DayProgress>): void {
+export function saveSession(session: GambitSession): void {
   if (typeof window === "undefined") return;
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(progress));
+  try {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: STORAGE_VERSION,
+        lastSelectedKey: session.lastSelectedKey,
+        days: session.days,
+      } satisfies GambitSession),
+    );
+  } catch {
+    // Private mode or quota — keep the in-memory session either way.
+  }
+}
+
+export function loadProgress(): Record<string, DayProgress> {
+  return loadSession().days;
+}
+
+export function saveProgress(progress: Record<string, DayProgress>): void {
+  const current = loadSession();
+  saveSession({ ...current, days: progress });
 }
 
 export function shiftDateKey(key: string, deltaDays: number): string {
