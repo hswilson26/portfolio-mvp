@@ -256,6 +256,24 @@ export function shiftDateKey(key: string, deltaDays: number): string {
   return toDateKey(next);
 }
 
+/** Newest unlocked date that still has an unsolved puzzle, skipping `exceptKey`. */
+export function mostRecentUnsolvedKey(
+  progress: Record<string, DayProgress>,
+  todayKey: string,
+  exceptKey?: string | null,
+): string | null {
+  const start = archiveStartDate();
+  const cursor = parseDateKey(todayKey);
+  while (startOfDay(cursor).getTime() >= start.getTime()) {
+    const key = toDateKey(cursor);
+    if (key !== exceptKey && getPuzzleForDate(cursor) && !progress[key]?.completed) {
+      return key;
+    }
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return null;
+}
+
 export function monthGrid(year: number, monthIndex: number) {
   const first = new Date(year, monthIndex, 1);
   const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();

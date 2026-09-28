@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import Link from "next/link";
 import { Chess, type Square } from "chess.js";
@@ -31,6 +32,7 @@ import {
   saveProgress,
   scoreBreakdown,
   shiftDateKey,
+  mostRecentUnsolvedKey,
   themeLabel,
   toDateKey,
   verifyArchive,
@@ -94,11 +96,32 @@ export default function DailyChessPage() {
   const [coachNote, setCoachNote] = useState<string | null>(null);
   const [copiedShare, setCopiedShare] = useState(false);
   const [showResults, setShowResults] = useState(false);
+  const [dragGhost, setDragGhost] = useState<{
+    from: string;
+    type: string;
+    color: "w" | "b";
+    x: number;
+    y: number;
+    size: number;
+    over: string | null;
+  } | null>(null);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const selectedSquareRef = useRef<string | null>(null);
   const solutionIndexRef = useRef(0);
   const gameFenRef = useRef<string | null>(null);
+  const dragStartRef = useRef<{
+    from: string;
+    type: string;
+    color: "w" | "b";
+    x: number;
+    y: number;
+    size: number;
+    pointerId: number;
+  } | null>(null);
+  const dragMovedRef = useRef(false);
+  const suppressClickRef = useRef(false);
+  const stopDragListenersRef = useRef<(() => void) | null>(null);
 
   selectedSquareRef.current = selectedSquare;
   solutionIndexRef.current = solutionIndex;
@@ -151,6 +174,9 @@ export default function DailyChessPage() {
     setShakeSquare(null);
     setIsOpponentMoving(false);
     setCoachNote(null);
+    setDragGhost(null);
+    dragStartRef.current = null;
+    dragMovedRef.current = false;
     playSound(260, "sine", 0.08);
   }, [puzzle]);
 
@@ -203,6 +229,9 @@ export default function DailyChessPage() {
     setShakeSquare(null);
     setIsOpponentMoving(false);
     setCoachNote(null);
+    setDragGhost(null);
+    dragStartRef.current = null;
+    dragMovedRef.current = false;
     setShowResults(alreadySolved);
     setCopiedShare(false);
     // Timer and mistake counts live in `progress` and must not reset here.
@@ -265,40 +294,30 @@ export default function DailyChessPage() {
     setSelectedSquare(null);
   };
 
-  const handleSquareClick = (sq: string) => {
+  const squareFromPoint = (x: number, y: number) => {
+    const node = document.elementFromPoint(x, y);
+    if (!(node instanceof Element)) return null;
+    return node.closest("[data-square]")?.getAttribute("data-square") ?? null;
+  };
+
+  const clearDrag = () => {
+    stopDragListenersRef.current?.();
+    stopDragListenersRef.current = null;
+    dragStartRef.current = null;
+    dragMovedRef.current = false;
+    setDragGhost(null);
+  };
+
+  const playUserMove = (from: string, to: string) => {
     if (!puzzle || isCompleted || isOpponentMoving) return;
+    if (from === to) return;
 
     const board = new Chess(gameFenRef.current ?? puzzle.fen);
-    const clickedPiece = board.get(sq as Square);
-    const currentSelected = selectedSquareRef.current;
-
-    if (!currentSelected) {
-      if (clickedPiece && clickedPiece.color === puzzle.playerColor) {
-        selectedSquareRef.current = sq;
-        setSelectedSquare(sq);
-        playSound(440, "triangle", 0.05);
-      }
-      return;
-    }
-
-    if (currentSelected === sq) {
-      selectedSquareRef.current = null;
-      setSelectedSquare(null);
-      return;
-    }
-
-    if (clickedPiece && clickedPiece.color === puzzle.playerColor) {
-      selectedSquareRef.current = sq;
-      setSelectedSquare(sq);
-      playSound(440, "triangle", 0.05);
-      return;
-    }
-
-    const legalFromSelected = board.moves({
-      square: currentSelected as Square,
+    const legalFrom = board.moves({
+      square: from as Square,
       verbose: true,
     });
-    const candidate = legalFromSelected.find((move) => move.to === sq);
+    const candidate = legalFrom.find((move) => move.to === to);
     if (!candidate) {
       selectedSquareRef.current = null;
       setSelectedSquare(null);
@@ -314,12 +333,11 @@ export default function DailyChessPage() {
       promotion: candidate.promotion,
     });
     const isMate = probe.isCheckmate();
-    const isCorrect =
-      playedUci === expected || (puzzle.isMateInOne && isMate);
+    const isCorrect = playedUci === expected || (puzzle.isMateInOne && isMate);
 
     if (!isCorrect) {
       selectedSquareRef.current = null;
-      registerMistake(currentSelected);
+      registerMistake(from);
       return;
     }
 
@@ -356,6 +374,124 @@ export default function DailyChessPage() {
     }, 520);
   };
 
+  const handlePiecePointerDown = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    sq: string,
+    piece: { type: string; color: "w" | "b" },
+  ) => {
+    if (!puzzle || isCompleted || isOpponentMoving) return;
+    if (piece.color !== puzzle.playerColor) return;
+    if (event.button !== 0 && event.pointerType === "mouse") return;
+
+    clearDrag();
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    const pointerId = event.pointerId;
+    dragStartRef.current = {
+      from: sq,
+      type: piece.type,
+      color: piece.color,
+      x: event.clientX,
+      y: event.clientY,
+      size: rect.width,
+      pointerId,
+    };
+    dragMovedRef.current = false;
+
+    try {
+      event.currentTarget.setPointerCapture(pointerId);
+    } catch {
+      // Synthetic or already-released pointers can throw; window listeners still track the drag.
+    }
+
+    const onMove = (moveEvent: PointerEvent) => {
+      const start = dragStartRef.current;
+      if (!start || start.pointerId !== moveEvent.pointerId) return;
+      if (moveEvent.buttons === 0) {
+        onUp(moveEvent);
+        return;
+      }
+
+      const dx = moveEvent.clientX - start.x;
+      const dy = moveEvent.clientY - start.y;
+      if (!dragMovedRef.current) {
+        if (Math.hypot(dx, dy) < 8) return;
+        dragMovedRef.current = true;
+        selectedSquareRef.current = start.from;
+        setSelectedSquare(start.from);
+        moveEvent.preventDefault();
+      }
+
+      setDragGhost({
+        from: start.from,
+        type: start.type,
+        color: start.color,
+        x: moveEvent.clientX,
+        y: moveEvent.clientY,
+        size: start.size,
+        over: squareFromPoint(moveEvent.clientX, moveEvent.clientY),
+      });
+    };
+
+    const onUp = (upEvent: PointerEvent) => {
+      const start = dragStartRef.current;
+      if (!start || start.pointerId !== upEvent.pointerId) return;
+      const moved = dragMovedRef.current;
+      const over = squareFromPoint(upEvent.clientX, upEvent.clientY);
+      clearDrag();
+      if (!moved) return;
+      suppressClickRef.current = true;
+      if (over && over !== start.from) {
+        playUserMove(start.from, over);
+      }
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    stopDragListenersRef.current = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  };
+
+  const handleSquareClick = (sq: string) => {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
+    if (!puzzle || isCompleted || isOpponentMoving) return;
+
+    const board = new Chess(gameFenRef.current ?? puzzle.fen);
+    const clickedPiece = board.get(sq as Square);
+    const currentSelected = selectedSquareRef.current;
+
+    if (!currentSelected) {
+      if (clickedPiece && clickedPiece.color === puzzle.playerColor) {
+        selectedSquareRef.current = sq;
+        setSelectedSquare(sq);
+        playSound(440, "triangle", 0.05);
+      }
+      return;
+    }
+
+    if (currentSelected === sq) {
+      selectedSquareRef.current = null;
+      setSelectedSquare(null);
+      return;
+    }
+
+    if (clickedPiece && clickedPiece.color === puzzle.playerColor) {
+      selectedSquareRef.current = sq;
+      setSelectedSquare(sq);
+      playSound(440, "triangle", 0.05);
+      return;
+    }
+
+    playUserMove(currentSelected, sq);
+  };
+
   const shareText = puzzle && selectedDate && scoring
     ? `♟️ Daily Gambit — ${formatDisplayDate(selectedDate)}
 ${"♥".repeat(heartsLeft)}${"♡".repeat(STARTING_HEARTS - heartsLeft)}
@@ -374,6 +510,9 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
   };
 
   const playerIsBlack = puzzle?.playerColor === "b";
+  const sideToMove = chess.turn();
+  const turnIsWhite = sideToMove === "w";
+  const dimOpponents = Boolean(puzzle) && !isCompleted && !isOpponentMoving;
   const ranks = playerIsBlack ? [1, 2, 3, 4, 5, 6, 7, 8] : [8, 7, 6, 5, 4, 3, 2, 1];
   const files = playerIsBlack ? [...FILES].reverse() : [...FILES];
 
@@ -381,6 +520,9 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
   const nextKey = selectedKey ? shiftDateKey(selectedKey, 1) : null;
   const canGoPrev = Boolean(todayDate && prevKey && canAccessDate(parseDateKey(prevKey), todayDate));
   const canGoNext = Boolean(todayDate && nextKey && canAccessDate(parseDateKey(nextKey), todayDate));
+  const latestUnsolvedKey = todayKey
+    ? mostRecentUnsolvedKey(progress, todayKey, selectedKey)
+    : null;
 
   return (
     <div
@@ -460,11 +602,21 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
             >
               {puzzle ? primaryTheme(puzzle.themes) : "Daily Puzzle"}
             </h1>
-            <p className="mt-1 text-sm italic text-[#d7c7a4]">
-              {puzzle
-                ? `${puzzle.playerColor === "w" ? "White" : "Black"} to play · Lichess ${puzzle.id} · ${puzzle.rating} Elo`
-                : "Loading the daily position…"}
-            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-2.5">
+              {puzzle ? (
+                <TurnBadge
+                  color={isCompleted ? puzzle.playerColor : sideToMove}
+                  status={isCompleted ? "solved" : isOpponentMoving ? "reply" : "play"}
+                />
+              ) : (
+                <p className="text-sm italic text-[#d7c7a4]">Loading the daily position…</p>
+              )}
+              {puzzle ? (
+                <p className="text-sm text-[#d7c7a4]">
+                  Lichess {puzzle.id} · {puzzle.rating} Elo
+                </p>
+              ) : null}
+            </div>
           </div>
 
           <div className="flex items-center gap-2">
@@ -501,12 +653,24 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
 
         <div className="grid items-start gap-8 lg:grid-cols-12">
           <div className="lg:col-span-7">
-            <div className="rounded-sm border-[10px] border-[#5c3317] bg-[#3d2212] p-3 shadow-[0_20px_50px_rgba(0,0,0,0.45)]">
-              <div className="mb-2 flex items-center justify-between px-1 text-[11px] uppercase tracking-[0.18em] text-[#e6d3a8]">
+            <div
+              className={`rounded-sm border-[10px] border-[#5c3317] bg-[#3d2212] p-3 shadow-[0_20px_50px_rgba(0,0,0,0.45)] ${
+                isCompleted
+                  ? "ring-4 ring-[#c6a046]/70"
+                  : turnIsWhite
+                    ? "ring-4 ring-[#fff8eb]"
+                    : "ring-4 ring-[#1a120c]"
+              }`}
+            >
+              <div className="mb-2 flex items-center justify-between gap-3 px-1 text-[11px] uppercase tracking-[0.18em] text-[#e6d3a8]">
                 <span>Staunton Club Board</span>
-                <span>{isCompleted ? "Solved" : isOpponentMoving ? "Reply…" : "Your move"}</span>
+                <TurnBadge
+                  color={isCompleted && puzzle ? puzzle.playerColor : sideToMove}
+                  status={isCompleted ? "solved" : isOpponentMoving ? "reply" : "play"}
+                  compact
+                />
               </div>
-              <div className="grid aspect-square grid-cols-8 overflow-hidden rounded-sm border-2 border-[#2a170c] shadow-inner">
+              <div className="grid aspect-square grid-cols-8 grid-rows-8 overflow-hidden rounded-sm border-2 border-[#2a170c] shadow-inner [grid-template-rows:repeat(8,minmax(0,1fr))] [grid-template-columns:repeat(8,minmax(0,1fr))]">
                 {ranks.map((rank, rIdx) =>
                   files.map((file, fIdx) => {
                     const sq = `${file}${rank}`;
@@ -516,19 +680,32 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
                     const isLast = lastMove?.from === sq || lastMove?.to === sq;
                     const isLegal = legalDestinationSquares.has(sq);
 
+                    const isDragOver = dragGhost?.over === sq && dragGhost.from !== sq;
+                    const canDrag =
+                      Boolean(piece) &&
+                      !isCompleted &&
+                      !isOpponentMoving &&
+                      piece?.color === puzzle?.playerColor;
+
                     let squareBg = isDark ? "bg-[#b58863]" : "bg-[#f0d9b5]";
                     if (isSelected) squareBg = "bg-[#c6a046] ring-4 ring-[#5c3317] ring-inset";
+                    else if (isDragOver && isLegal) squareBg = "bg-[#c6a046]/80";
                     else if (isLast) squareBg = isDark ? "bg-[#c0a06a]" : "bg-[#e6c27a]";
 
                     return (
                       <button
                         key={sq}
                         type="button"
+                        data-square={sq}
+                        draggable={false}
                         onClick={() => handleSquareClick(sq)}
+                        onPointerDown={
+                          piece ? (event) => handlePiecePointerDown(event, sq, piece) : undefined
+                        }
                         aria-label={`Square ${sq}`}
-                        className={`relative flex items-center justify-center ${squareBg} ${
+                        className={`relative flex min-h-0 min-w-0 touch-none items-center justify-center overflow-hidden ${squareBg} ${
                           shakeSquare === sq ? "animate-bounce bg-red-800/70" : ""
-                        }`}
+                        } ${canDrag ? (dragGhost ? "cursor-grabbing" : "cursor-grab") : ""}`}
                       >
                         {fIdx === 0 && (
                           <span
@@ -548,7 +725,15 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
                             {file}
                           </span>
                         )}
-                        {piece ? <ChessPieceSvg type={piece.type} color={piece.color} /> : null}
+                        {piece ? (
+                          <span
+                            className={`flex h-full w-full items-center justify-center ${
+                              dimOpponents && piece.color !== sideToMove ? "opacity-80" : ""
+                            } ${dragGhost?.from === sq ? "opacity-20" : ""}`}
+                          >
+                            <ChessPieceSvg type={piece.type} color={piece.color} />
+                          </span>
+                        ) : null}
                         {isLegal && !piece && (
                           <span className="size-3.5 rounded-full bg-[#1a1511]/40" />
                         )}
@@ -565,7 +750,7 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-[#d7c7a4]">
               <p className="italic">
                 {coachNote ??
-                  "Select your piece. Dots appear only on moves that are legal in this position."}
+                  "Select a piece, or drag it. Dots appear only on moves that are legal in this position."}
               </p>
               <button
                 type="button"
@@ -583,18 +768,16 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
 
           <aside className="flex flex-col gap-5 lg:col-span-5">
             <section className="rounded-sm border border-[#c6a046]/35 bg-[#f3e6c9] p-5 text-[#2c2419] shadow-xl">
-              <div className="flex items-center justify-between">
-                <h2
-                  className="text-sm uppercase tracking-[0.18em] text-[#7a5b28]"
-                  style={{ fontFamily: "var(--font-chess-display), Georgia, serif" }}
-                >
-                  Live score
-                </h2>
-                <span className="font-mono text-xl font-bold text-[#5c3317]">
-                  {scoring?.total ?? "—"}
-                </span>
-              </div>
-              <dl className="mt-4 space-y-2 text-sm">
+              <h2
+                className="text-sm uppercase tracking-[0.18em] text-[#7a5b28]"
+                style={{ fontFamily: "var(--font-chess-display), Georgia, serif" }}
+              >
+                Live score
+              </h2>
+              <p className="mt-2 font-mono text-5xl font-bold leading-none tracking-tight text-[#5c3317] sm:text-6xl">
+                {scoring?.total ?? "—"}
+              </p>
+              <dl className="mt-5 space-y-2 text-sm">
                 <div className="flex justify-between">
                   <dt>Base ({puzzle ? `${puzzle.rating} Elo` : "—"})</dt>
                   <dd className="font-mono">+{scoring?.base ?? 0}</dd>
@@ -627,6 +810,14 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
               </h2>
               {puzzle ? (
                 <ul className="mt-3 space-y-2 text-sm text-[#e6d5b0]">
+                  <li className="flex items-center gap-2">
+                    Side to move:
+                    <TurnBadge
+                      color={isCompleted ? puzzle.playerColor : sideToMove}
+                      status={isCompleted ? "solved" : isOpponentMoving ? "reply" : "play"}
+                      compact
+                    />
+                  </li>
                   <li>Theme: {puzzle.themes.map(themeLabel).join(" · ")}</li>
                   <li>
                     Source:{" "}
@@ -663,6 +854,23 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
           </aside>
         </div>
       </main>
+
+      {dragGhost && (
+        <div
+          aria-hidden
+          className="pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-1/2 drop-shadow-2xl"
+          style={{
+            left: dragGhost.x,
+            top: dragGhost.y,
+            width: dragGhost.size,
+            height: dragGhost.size,
+          }}
+        >
+          <div className="relative h-full w-full">
+            <ChessPieceSvg type={dragGhost.type} color={dragGhost.color} />
+          </div>
+        </div>
+      )}
 
       {calendarOpen && todayDate && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0a1812]/80 p-4">
@@ -827,12 +1035,22 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
               >
                 Back to the board
               </button>
-              {canGoNext && nextKey && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowResults(false);
+                  setCalendarOpen(true);
+                }}
+                className="rounded-sm border border-[#c6a046] bg-[#fff8e8] px-4 py-2.5 text-sm font-medium text-[#5c3317] hover:bg-[#f3e6c9]"
+              >
+                Play a previous day’s puzzle
+              </button>
+              {latestUnsolvedKey && (
                 <button
                   type="button"
                   onClick={() => {
                     setShowResults(false);
-                    selectDate(nextKey);
+                    selectDate(latestUnsolvedKey);
                   }}
                   className="text-sm text-[#7a5b28]"
                 >
@@ -844,6 +1062,56 @@ Lichess ${puzzle.id} · ${primaryTheme(puzzle.themes)}`
         </div>
       )}
     </div>
+  );
+}
+
+function TurnBadge({
+  color,
+  status,
+  compact = false,
+}: {
+  color: "w" | "b";
+  status: "play" | "reply" | "solved";
+  compact?: boolean;
+}) {
+  const isWhite = color === "w";
+  const label =
+    status === "solved"
+      ? "Solved"
+      : status === "reply"
+        ? `${isWhite ? "White" : "Black"} replies`
+        : `${isWhite ? "White" : "Black"} to move`;
+
+  if (status === "solved") {
+    return (
+      <span
+        className={`inline-flex items-center gap-2 rounded-sm border-2 border-[#c6a046] bg-[#173528] font-semibold tracking-[0.12em] text-[#f6ead0] uppercase ${
+          compact ? "px-2 py-0.5 text-[10px]" : "px-3 py-1.5 text-xs"
+        }`}
+      >
+        {label}
+      </span>
+    );
+  }
+
+  return (
+    <span
+      className={`inline-flex items-center gap-2 rounded-sm border-2 font-semibold tracking-[0.14em] uppercase ${
+        compact ? "px-2 py-0.5 text-[10px]" : "px-3 py-1.5 text-xs sm:text-sm"
+      } ${
+        isWhite
+          ? "border-[#f6ead0] bg-[#fff8eb] text-[#2c2419] shadow-[0_0_0_1px_#5c3317]"
+          : "border-[#c6a046] bg-[#1c1410] text-[#f6ead0] shadow-[0_0_12px_rgba(0,0,0,0.45)]"
+      }`}
+    >
+      <span
+        aria-hidden
+        className={`rounded-full border-2 ${compact ? "size-3" : "size-4"} ${
+          isWhite ? "border-[#5c3317] bg-[#fff8eb]" : "border-[#c6a046] bg-[#1c1410]"
+        }`}
+      />
+      {label}
+    </span>
   );
 }
 
