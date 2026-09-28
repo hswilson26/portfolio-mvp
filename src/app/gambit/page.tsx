@@ -303,7 +303,7 @@ export default function DailyChessPage() {
     setShowResults(alreadySolved);
     setCopiedShare(false);
     if (resultsTimerRef.current) {
-      window.clearTimeout(resultsTimerRef.current);
+      clearTimeout(resultsTimerRef.current);
       resultsTimerRef.current = null;
     }
     // Timer and mistake counts live in `progress` and must not reset here.
@@ -341,7 +341,7 @@ export default function DailyChessPage() {
 
   useEffect(() => {
     return () => {
-      if (resultsTimerRef.current) window.clearTimeout(resultsTimerRef.current);
+      if (resultsTimerRef.current) clearTimeout(resultsTimerRef.current);
     };
   }, []);
 
@@ -383,12 +383,12 @@ export default function DailyChessPage() {
     });
     playSound(784, "triangle", 0.28);
     window.setTimeout(() => playSound(988, "triangle", 0.22), 140);
-    if (resultsTimerRef.current) window.clearTimeout(resultsTimerRef.current);
+    if (resultsTimerRef.current) clearTimeout(resultsTimerRef.current);
     if (revealDelayMs <= 0) {
       setShowResults(true);
       return;
     }
-    resultsTimerRef.current = window.setTimeout(() => {
+    resultsTimerRef.current = setTimeout(() => {
       resultsTimerRef.current = null;
       if (selectedKeyRef.current !== dayKey) return;
       setShowResults(true);
