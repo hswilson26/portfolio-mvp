@@ -13,6 +13,21 @@ export interface Project {
 
 export const projects: Project[] = [
   {
+    title: "Closet Relay",
+    description:
+      "Circular fashion demo: buyers shop curated secondhand; sellers ship or drop off an entire closet and get a guaranteed post-intake payout with transparent platform, cleaning, and logistics fees. Listings are auto-managed; sellers track items and their statement in My closet.",
+    techStack: [
+      "Next.js",
+      "React 19",
+      "Two-sided marketplace",
+      "Cart + localStorage",
+      "Tailwind CSS",
+    ],
+    status: "Live",
+    demoUrl: "/shop",
+    githubUrl: "https://github.com/hswil/portfolio-mvp",
+  },
+  {
     title: "Daily Gambit",
     description:
       "One verified chess tactic each day in the Chess.com Daily Puzzle style: a calendar of today and past dates, hearts and a live clock that never resets on retry, and positions sourced from the Lichess public puzzle archive.",
