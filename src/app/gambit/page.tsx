@@ -12,10 +12,13 @@ import {
 import { Chess, type Square } from "chess.js";
 import { Libre_Baskerville, Playfair_Display } from "next/font/google";
 import { ChessPieceSvg } from "@/components/chess-piece";
+import { PuzzleCountdown, PuzzEloIntro, PuzzEloShowcase } from "@/components/puzzelo";
 import {
   STARTING_HEARTS,
+  STARTING_PUZZELO,
   TIME_PENALTY_PER_SEC,
   MISTAKE_PENALTY,
+  applyPuzzElo,
   canAccessDate,
   currentStreak,
   emptyProgress,
@@ -35,6 +38,7 @@ import {
   mostRecentUnsolvedKey,
   themeLabel,
   toDateKey,
+  uciMatches,
   verifyArchive,
   type BoardSnapshot,
   type DayProgress,
@@ -54,6 +58,7 @@ const baskerville = Libre_Baskerville({
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const FILES = ["a", "b", "c", "d", "e", "f", "g", "h"] as const;
+const PROMOTION_CHOICES = ["q", "r", "b", "n"] as const;
 const SOLVE_REVEAL_MS = 1800;
 const OPPONENT_REPLY_MS = 700;
 
@@ -65,18 +70,29 @@ type MoveFeedback = {
   message: string;
 };
 
-function playSound(freq: number, type: OscillatorType = "sine", duration = 0.12) {
+let sharedAudio: AudioContext | null = null;
+
+function getAudioContext(): AudioContext | null {
+  const AudioCtx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) return null;
+  if (!sharedAudio) sharedAudio = new AudioCtx();
+  if (sharedAudio.state === "suspended") {
+    void sharedAudio.resume();
+  }
+  return sharedAudio;
+}
+
+function playSound(freq: number, type: OscillatorType = "sine", duration = 0.12, volume = 0.08) {
   try {
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (!AudioCtx) return;
-    const ctx = new AudioCtx();
+    const ctx = getAudioContext();
+    if (!ctx) return;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.type = type;
     osc.frequency.setValueAtTime(freq, ctx.currentTime);
-    gain.gain.setValueAtTime(0.08, ctx.currentTime);
+    gain.gain.setValueAtTime(volume, ctx.currentTime);
     gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
     osc.connect(gain);
     gain.connect(ctx.destination);
@@ -87,11 +103,20 @@ function playSound(freq: number, type: OscillatorType = "sine", duration = 0.12)
   }
 }
 
+function playCountdownTick(step: number | "go") {
+  if (step === 3) playSound(392, "square", 0.14, 0.07);
+  else if (step === 2) playSound(494, "square", 0.14, 0.08);
+  else if (step === 1) playSound(587, "square", 0.16, 0.09);
+  else playSound(784, "triangle", 0.32, 0.1);
+}
+
 export default function DailyChessPage() {
   const calendarTitleId = useId();
   const resultsTitleId = useId();
+  const eloIntroTitleId = useId();
 
   const [mounted, setMounted] = useState(false);
+  const [sessionReady, setSessionReady] = useState(false);
   const [todayKey, setTodayKey] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [progress, setProgress] = useState<Record<string, DayProgress>>({});
@@ -108,6 +133,13 @@ export default function DailyChessPage() {
   const [copiedShare, setCopiedShare] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const [playUrl, setPlayUrl] = useState("");
+  const [puzzElo, setPuzzElo] = useState(STARTING_PUZZELO);
+  const [seenEloIntro, setSeenEloIntro] = useState(true);
+  const [countdown, setCountdown] = useState<number | "go" | null>(null);
+  const [clockLive, setClockLive] = useState(false);
+  const [pendingPromotion, setPendingPromotion] = useState<{ from: string; to: string } | null>(
+    null,
+  );
   const [dragGhost, setDragGhost] = useState<{
     from: string;
     type: string;
@@ -126,6 +158,7 @@ export default function DailyChessPage() {
   const persistReadyRef = useRef(false);
   const selectedKeyRef = useRef<string | null>(null);
   const resultsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const dragStartRef = useRef<{
     from: string;
     type: string;
@@ -158,6 +191,9 @@ export default function DailyChessPage() {
     : null;
   const streak = todayKey ? currentStreak(progress, todayKey) : 0;
   const isToday = Boolean(todayKey && selectedKey === todayKey);
+  const showEloIntro = mounted && !seenEloIntro;
+  const boardLocked =
+    isCompleted || isOpponentMoving || !clockLive || showEloIntro || Boolean(pendingPromotion);
 
   const chess = useMemo(() => {
     try {
@@ -194,6 +230,7 @@ export default function DailyChessPage() {
     setIsOpponentMoving(false);
     setMoveFeedback(null);
     setDragGhost(null);
+    setPendingPromotion(null);
     dragStartRef.current = null;
     dragMovedRef.current = false;
     setProgress((prev) => {
@@ -219,21 +256,21 @@ export default function DailyChessPage() {
     const session = loadSession();
     const lastKey = session.lastSelectedKey;
     const lastDate = lastKey ? parseDateKey(lastKey) : null;
-    const resumeUnsolved =
-      lastKey &&
-      lastDate &&
-      canAccessDate(lastDate, now) &&
-      !session.days[lastKey]?.completed;
+    const resumeKey =
+      lastKey && lastDate && canAccessDate(lastDate, now) ? lastKey : key;
 
     setTodayKey(key);
-    setSelectedKey(resumeUnsolved ? lastKey : key);
+    setSelectedKey(resumeKey);
     setCalendarCursor({
-      year: (resumeUnsolved && lastDate ? lastDate : now).getFullYear(),
-      month: (resumeUnsolved && lastDate ? lastDate : now).getMonth(),
+      year: (resumeKey !== key && lastDate ? lastDate : now).getFullYear(),
+      month: (resumeKey !== key && lastDate ? lastDate : now).getMonth(),
     });
     setProgress(session.days);
+    setPuzzElo(session.puzzElo);
+    setSeenEloIntro(session.seenPuzzEloIntro);
     setPlayUrl(`${window.location.origin}/gambit`);
     setMounted(true);
+    setSessionReady(true);
     persistReadyRef.current = true;
 
     if (process.env.NODE_ENV === "development") {
@@ -300,10 +337,13 @@ export default function DailyChessPage() {
     setIsOpponentMoving(false);
     setMoveFeedback(null);
     setDragGhost(null);
+    setPendingPromotion(null);
     dragStartRef.current = null;
     dragMovedRef.current = false;
-    setShowResults(alreadySolved);
+    setShowResults(false);
     setCopiedShare(false);
+    setClockLive(false);
+    setCountdown(null);
     if (resultsTimerRef.current) {
       clearTimeout(resultsTimerRef.current);
       resultsTimerRef.current = null;
@@ -313,16 +353,58 @@ export default function DailyChessPage() {
   }, [puzzle?.id, selectedKey]);
 
   useEffect(() => {
+    if (countdownRef.current) {
+      clearInterval(countdownRef.current);
+      countdownRef.current = null;
+    }
+    if (!sessionReady || !mounted || showEloIntro || !puzzle || !selectedKey || isCompleted) {
+      setCountdown(null);
+      setClockLive(false);
+      return;
+    }
+
+    setClockLive(false);
+    setCountdown(3);
+    countdownRef.current = setInterval(() => {
+      setCountdown((current) => {
+        if (current === 3) return 2;
+        if (current === 2) return 1;
+        if (current === 1) return "go";
+        if (countdownRef.current) {
+          clearInterval(countdownRef.current);
+          countdownRef.current = null;
+        }
+        setClockLive(true);
+        return null;
+      });
+    }, 900);
+
+    return () => {
+      if (countdownRef.current) {
+        clearInterval(countdownRef.current);
+        countdownRef.current = null;
+      }
+    };
+  }, [sessionReady, mounted, showEloIntro, puzzle?.id, selectedKey, isCompleted]);
+
+  useEffect(() => {
+    if (countdown === null) return;
+    playCountdownTick(countdown);
+  }, [countdown]);
+
+  useEffect(() => {
     if (!mounted || !persistReadyRef.current) return;
     saveSession({
       version: STORAGE_VERSION,
       lastSelectedKey: selectedKey,
       days: progress,
+      puzzElo,
+      seenPuzzEloIntro: seenEloIntro,
     });
-  }, [progress, selectedKey, mounted]);
+  }, [progress, selectedKey, mounted, puzzElo, seenEloIntro]);
 
   useEffect(() => {
-    if (!mounted || !selectedKey || isCompleted) {
+    if (!mounted || !selectedKey || isCompleted || !clockLive || showEloIntro) {
       if (timerRef.current) clearInterval(timerRef.current);
       return;
     }
@@ -339,7 +421,7 @@ export default function DailyChessPage() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [mounted, selectedKey, isCompleted]);
+  }, [mounted, selectedKey, isCompleted, clockLive, showEloIntro]);
 
   useEffect(() => {
     return () => {
@@ -372,14 +454,24 @@ export default function DailyChessPage() {
       solutionIndex: solutionIndexRef.current,
       lastMove: lastMoveRef.current,
     };
+    const record = getPuzzleForDate(parseDateKey(dayKey));
     setProgress((prev) => {
       const current = prev[dayKey] ?? emptyProgress();
+      if (current.completed) return prev;
+      const update = record
+        ? applyPuzzElo(puzzElo, record.rating, current.mistakes, current.seconds)
+        : null;
+      if (update) {
+        queueMicrotask(() => setPuzzElo(update.next));
+      }
       return {
         ...prev,
         [dayKey]: {
           ...current,
           completed: true,
           board: snapshot.fen ? snapshot : current.board,
+          eloDelta: update?.delta ?? current.eloDelta ?? null,
+          eloAfter: update?.next ?? current.eloAfter ?? null,
         },
       };
     });
@@ -395,7 +487,7 @@ export default function DailyChessPage() {
       if (selectedKeyRef.current !== dayKey) return;
       setShowResults(true);
     }, revealDelayMs);
-  }, []);
+  }, [puzzElo]);
 
   const registerMistake = (from: string, to: string, san: string) => {
     if (!selectedKey) return;
@@ -430,8 +522,10 @@ export default function DailyChessPage() {
     setDragGhost(null);
   };
 
-  const playUserMove = (from: string, to: string) => {
-    if (!puzzle || isCompleted || isOpponentMoving || !selectedKey) return;
+  const playUserMove = (from: string, to: string, promotion?: string) => {
+    if (!puzzle || isCompleted || isOpponentMoving || !clockLive || showEloIntro || !selectedKey) {
+      return;
+    }
     if (from === to) return;
     const dayKey = selectedKey;
 
@@ -440,10 +534,11 @@ export default function DailyChessPage() {
       square: from as Square,
       verbose: true,
     });
-    const candidate = legalFrom.find((move) => move.to === to);
-    if (!candidate) {
+    const destMoves = legalFrom.filter((move) => move.to === to);
+    if (destMoves.length === 0) {
       selectedSquareRef.current = null;
       setSelectedSquare(null);
+      setPendingPromotion(null);
       setMoveFeedback({
         tone: "wrong",
         san: `${from}→${to}`,
@@ -457,7 +552,26 @@ export default function DailyChessPage() {
       return;
     }
 
+    const promoOptions = destMoves.filter((move) => Boolean(move.promotion));
+    if (promoOptions.length > 1 && !promotion) {
+      setPendingPromotion({ from, to });
+      selectedSquareRef.current = null;
+      setSelectedSquare(null);
+      playSound(523, "triangle", 0.08);
+      return;
+    }
+
     const expected = puzzle.solution[solutionIndexRef.current];
+    const expectedPromo = expected && expected.length > 4 ? expected[4].toLowerCase() : "q";
+    const candidate =
+      destMoves.find((move) =>
+        promotion
+          ? (move.promotion ?? "").toLowerCase() === promotion.toLowerCase()
+          : !move.promotion || (move.promotion ?? "").toLowerCase() === expectedPromo,
+      ) ??
+      destMoves.find((move) => (move.promotion ?? "").toLowerCase() === "q") ??
+      destMoves[0];
+
     const playedUci = `${candidate.from}${candidate.to}${candidate.promotion ?? ""}`;
     const probe = new Chess(board.fen());
     probe.move({
@@ -466,9 +580,11 @@ export default function DailyChessPage() {
       promotion: candidate.promotion,
     });
     const isMate = probe.isCheckmate();
-    const isCorrect = playedUci === expected || (puzzle.isMateInOne && isMate);
+    const isCorrect =
+      (Boolean(expected) && uciMatches(playedUci, expected)) || (puzzle.isMateInOne && isMate);
     const san = candidate.san || `${from}→${to}`;
     const opponentName = puzzle.playerColor === "w" ? "Black" : "White";
+    setPendingPromotion(null);
 
     if (!isCorrect) {
       selectedSquareRef.current = null;
@@ -561,7 +677,7 @@ export default function DailyChessPage() {
     sq: string,
     piece: { type: string; color: "w" | "b" },
   ) => {
-    if (!puzzle || isCompleted || isOpponentMoving) return;
+    if (!puzzle || boardLocked) return;
     if (piece.color !== puzzle.playerColor) return;
     if (event.button !== 0 && event.pointerType === "mouse") return;
 
@@ -643,7 +759,7 @@ export default function DailyChessPage() {
       suppressClickRef.current = false;
       return;
     }
-    if (!puzzle || isCompleted || isOpponentMoving) return;
+    if (!puzzle || boardLocked) return;
 
     const board = new Chess(gameFenRef.current ?? puzzle.fen);
     const clickedPiece = board.get(sq as Square);
@@ -695,7 +811,7 @@ Play it: ${playUrl || "/gambit"}`
   const playerIsBlack = puzzle?.playerColor === "b";
   const sideToMove = chess.turn();
   const turnIsWhite = sideToMove === "w";
-  const dimOpponents = Boolean(puzzle) && !isCompleted && !isOpponentMoving;
+  const dimOpponents = Boolean(puzzle) && !isCompleted && clockLive && !isOpponentMoving;
   const ranks = playerIsBlack ? [1, 2, 3, 4, 5, 6, 7, 8] : [8, 7, 6, 5, 4, 3, 2, 1];
   const files = playerIsBlack ? [...FILES].reverse() : [...FILES];
 
@@ -706,6 +822,12 @@ Play it: ${playUrl || "/gambit"}`
   const latestUnsolvedKey = todayKey
     ? mostRecentUnsolvedKey(progress, todayKey, selectedKey)
     : null;
+
+  const playNextAvailablePuzzle = () => {
+    if (!latestUnsolvedKey) return;
+    setShowResults(false);
+    selectDate(latestUnsolvedKey);
+  };
 
   return (
     <div
@@ -742,12 +864,31 @@ Play it: ${playUrl || "/gambit"}`
               <span className="font-mono text-[#c6a046]">{streak}</span>
             </div>
             <div
-              title="The clock does not reset if you restart the board or browse another day"
-              className="flex items-center gap-1.5 rounded border border-[#c6a046]/25 bg-[#173528] px-2.5 py-1 text-xs"
+              title="Daily Gambit ELO updates when you finish a daily"
+              className="flex items-center gap-1.5 rounded border border-[#c6a046]/40 bg-[#173528] px-2.5 py-1 text-xs"
             >
-              <span className="hidden sm:inline text-[#d9c9a6]">Clock</span>
-              <span className="font-mono font-semibold text-[#f0d48a]">
-                {formatTime(dayStats.seconds)}
+              <span className="hidden text-[#d9c9a6] sm:inline">Daily Gambit ELO</span>
+              <span className="font-mono font-semibold text-[#f0d48a]">{puzzElo}</span>
+            </div>
+            <div
+              title="The clock does not reset if you restart the board or browse another day"
+              className={`flex w-[9.75rem] items-center justify-between gap-1.5 rounded border px-2.5 py-1 text-xs transition-colors duration-300 ${
+                clockLive && !isCompleted
+                  ? "border-[#c6a046] bg-[#5c3317]"
+                  : "border-[#c6a046]/25 bg-[#173528]"
+              }`}
+            >
+              <span className="text-[#d9c9a6]">
+                {clockLive && !isCompleted
+                  ? "On clock"
+                  : countdown !== null
+                    ? "Ready"
+                    : "Clock"}
+              </span>
+              <span className="w-10 text-right font-mono font-semibold tabular-nums text-[#f0d48a]">
+                {countdown !== null && countdown !== "go"
+                  ? countdown
+                  : formatTime(dayStats.seconds)}
               </span>
             </div>
             <div className="flex items-center gap-0.5 rounded border border-[#c6a046]/25 bg-[#173528] px-2 py-1 text-sm">
@@ -771,7 +912,7 @@ Play it: ${playUrl || "/gambit"}`
               {isToday ? "Today’s Puzzle" : "Archive Puzzle"}
             </p>
             <h1
-              className="mt-1 text-3xl text-[#f7eed8] sm:text-4xl"
+              className="mt-1 min-h-[2.5rem] text-3xl text-[#f7eed8] sm:min-h-[2.75rem] sm:text-4xl"
               style={{ fontFamily: "var(--font-chess-display), Georgia, serif" }}
             >
               {puzzle ? primaryTheme(puzzle.themes) : "Daily Puzzle"}
@@ -828,7 +969,7 @@ Play it: ${playUrl || "/gambit"}`
         <div className="grid items-start gap-8 lg:grid-cols-12">
           <div className="lg:col-span-7">
             <div
-              className={`relative rounded-sm border-[10px] border-[#5c3317] bg-[#3d2212] p-3 shadow-[0_20px_50px_rgba(0,0,0,0.45)] ${
+              className={`relative rounded-sm border-[10px] border-[#5c3317] bg-[#3d2212] p-3 shadow-[0_20px_50px_rgba(0,0,0,0.45)] transition-[box-shadow] duration-300 ${
                 isCompleted
                   ? "ring-4 ring-[#c6a046]/70"
                   : turnIsWhite
@@ -836,7 +977,7 @@ Play it: ${playUrl || "/gambit"}`
                     : "ring-4 ring-[#1a120c]"
               }`}
             >
-              <div className="mb-2 flex items-center justify-between gap-3 px-1 text-[11px] uppercase tracking-[0.18em] text-[#e6d3a8]">
+              <div className="mb-2 flex h-6 items-center justify-between gap-3 px-1 text-[11px] uppercase tracking-[0.18em] text-[#e6d3a8]">
                 <span>Staunton Club Board</span>
                 <TurnBadge
                   color={isCompleted && puzzle ? puzzle.playerColor : sideToMove}
@@ -844,8 +985,9 @@ Play it: ${playUrl || "/gambit"}`
                   compact
                 />
               </div>
+              <div className="relative">
               {moveFeedback?.tone === "solved" && !showResults && (
-                <div className="mb-2 rounded-sm border-2 border-[#c6a046] bg-[#0f241c] px-4 py-2 text-center">
+                <div className="gambit-overlay-in pointer-events-none absolute inset-x-2 top-2 z-10 rounded-sm border-2 border-[#c6a046] bg-[#0f241c]/92 px-4 py-2 text-center">
                   <p className="font-mono text-2xl font-bold tracking-wide text-[#f0d48a]">
                     {moveFeedback.san}
                   </p>
@@ -854,7 +996,10 @@ Play it: ${playUrl || "/gambit"}`
                   </p>
                 </div>
               )}
-              <div className="grid aspect-square grid-cols-8 grid-rows-8 overflow-hidden rounded-sm border-2 border-[#2a170c] shadow-inner [grid-template-rows:repeat(8,minmax(0,1fr))] [grid-template-columns:repeat(8,minmax(0,1fr))]">
+              <div
+                key={puzzle?.id ?? "empty"}
+                className="gambit-fade-in grid aspect-square grid-cols-8 grid-rows-8 overflow-hidden rounded-sm border-2 border-[#2a170c] shadow-inner [grid-template-rows:repeat(8,minmax(0,1fr))] [grid-template-columns:repeat(8,minmax(0,1fr))]"
+              >
                 {ranks.map((rank, rIdx) =>
                   files.map((file, fIdx) => {
                     const sq = `${file}${rank}`;
@@ -870,8 +1015,7 @@ Play it: ${playUrl || "/gambit"}`
                     const isDragOver = dragGhost?.over === sq && dragGhost.from !== sq;
                     const canDrag =
                       Boolean(piece) &&
-                      !isCompleted &&
-                      !isOpponentMoving &&
+                      !boardLocked &&
                       piece?.color === puzzle?.playerColor;
 
                     const isSuccessHighlight =
@@ -906,7 +1050,7 @@ Play it: ${playUrl || "/gambit"}`
                           piece ? (event) => handlePiecePointerDown(event, sq, piece) : undefined
                         }
                         aria-label={`Square ${sq}`}
-                        className={`relative flex min-h-0 min-w-0 touch-none items-center justify-center overflow-hidden ${squareBg} ${
+                        className={`relative flex min-h-0 min-w-0 touch-none items-center justify-center overflow-hidden transition-colors duration-200 ${squareBg} ${
                           shakeSquare === sq ? "animate-bounce bg-red-800/70" : ""
                         } ${canDrag ? (dragGhost ? "cursor-grabbing" : "cursor-grab") : ""}`}
                       >
@@ -948,22 +1092,77 @@ Play it: ${playUrl || "/gambit"}`
                   }),
                 )}
               </div>
+              {countdown !== null && !isCompleted && (
+                <PuzzleCountdown value={countdown} />
+              )}
+              {pendingPromotion && puzzle && (
+                <div className="gambit-overlay-in absolute inset-0 z-20 flex items-center justify-center rounded-sm bg-[#0a1812]/72">
+                  <div className="mx-3 w-full max-w-sm rounded-sm border-2 border-[#c6a046] bg-[#f3e6c9] p-4 text-center text-[#2c2419] shadow-2xl">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#7a5b28]">
+                      Promote pawn
+                    </p>
+                    <p className="mt-1 text-sm text-[#5c4a32]">
+                      Choose the piece for {pendingPromotion.from}→{pendingPromotion.to}.
+                    </p>
+                    <div className="mt-3 grid grid-cols-4 gap-2">
+                      {PROMOTION_CHOICES.map((piece) => (
+                        <button
+                          key={piece}
+                          type="button"
+                          onClick={() =>
+                            playUserMove(pendingPromotion.from, pendingPromotion.to, piece)
+                          }
+                          className="relative flex aspect-square items-center justify-center rounded-sm border-2 border-[#5c3317]/30 bg-[#fff8e8] hover:border-[#c6a046]"
+                          aria-label={`Promote to ${piece === "q" ? "queen" : piece === "r" ? "rook" : piece === "b" ? "bishop" : "knight"}`}
+                        >
+                          <ChessPieceSvg type={piece} color={puzzle.playerColor} />
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setPendingPromotion(null)}
+                      className="mt-3 text-sm text-[#7a5b28]"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+              {isCompleted && latestUnsolvedKey && (
+                <div className="gambit-overlay-in absolute inset-x-2 bottom-2 z-20">
+                  <button
+                    type="button"
+                    onClick={playNextAvailablePuzzle}
+                    className="w-full rounded-sm border-2 border-[#c6a046] bg-[#c6a046] px-4 py-3 text-base font-semibold tracking-wide text-[#2c2419] shadow-[0_8px_24px_rgba(0,0,0,0.45)] hover:bg-[#d4b056]"
+                  >
+                    Play Next Available Puzzle
+                  </button>
+                </div>
+              )}
+              </div>
             </div>
 
+            <div className="mt-4 min-h-[3.5rem]">
             {isCompleted && !showResults && (
               <button
                 type="button"
                 onClick={() => setShowResults(true)}
-                className="mt-4 w-full rounded-sm border-2 border-[#c6a046] bg-[#c6a046] px-4 py-3 text-base font-semibold tracking-wide text-[#2c2419] shadow-lg hover:bg-[#d4b056]"
+                className={`gambit-overlay-in w-full rounded-sm border-2 px-4 py-3 text-base font-semibold tracking-wide shadow-lg ${
+                  latestUnsolvedKey
+                    ? "border-[#c6a046]/50 bg-[#173528] text-[#f3e6c9] hover:border-[#c6a046]"
+                    : "border-[#c6a046] bg-[#c6a046] text-[#2c2419] hover:bg-[#d4b056]"
+                }`}
               >
                 View scorecard
               </button>
             )}
+            </div>
 
             <div
               role="status"
               aria-live="polite"
-              className={`mt-4 flex flex-wrap items-center justify-between gap-3 rounded-sm border px-3 py-2.5 text-sm ${
+              className={`mt-4 flex min-h-[3.25rem] flex-wrap items-center justify-between gap-3 rounded-sm border px-3 py-2.5 text-sm transition-colors duration-300 ${
                 moveFeedback?.tone === "wrong"
                   ? "border-[#c45c4a]/70 bg-[#3a1512] text-[#f6d5d0]"
                   : moveFeedback?.tone === "solved"
@@ -1004,6 +1203,11 @@ Play it: ${playUrl || "/gambit"}`
           </div>
 
           <aside className="flex flex-col gap-5 lg:col-span-5">
+            <PuzzEloShowcase
+              rating={puzzElo}
+              lastDelta={dayStats.eloDelta ?? null}
+              puzzleRating={puzzle?.rating ?? null}
+            />
             <section className="rounded-sm border border-[#c6a046]/35 bg-[#f3e6c9] p-5 text-[#2c2419] shadow-xl">
               <h2
                 className="text-sm uppercase tracking-[0.18em] text-[#7a5b28]"
@@ -1011,7 +1215,7 @@ Play it: ${playUrl || "/gambit"}`
               >
                 Live score
               </h2>
-              <p className="mt-2 font-mono text-5xl font-bold leading-none tracking-tight text-[#5c3317] sm:text-6xl">
+              <p className="mt-2 font-mono text-5xl font-bold leading-none tracking-tight tabular-nums text-[#5c3317] sm:text-6xl">
                 {scoring?.total ?? "—"}
               </p>
               {isCompleted && !showResults && (
@@ -1208,6 +1412,16 @@ Play it: ${playUrl || "/gambit"}`
         </div>
       )}
 
+      {showEloIntro && (
+        <PuzzEloIntro
+          titleId={eloIntroTitleId}
+          onBegin={() => {
+            getAudioContext();
+            setSeenEloIntro(true);
+          }}
+        />
+      )}
+
       {showResults && isCompleted && puzzle && scoring && selectedDate && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#0a1812]/75 p-4">
           <div
@@ -1230,7 +1444,7 @@ Play it: ${playUrl || "/gambit"}`
             <div className="mt-5 rounded-sm border border-[#c6a046]/50 bg-[#fff8e8] p-4">
               <p className="text-xs uppercase tracking-[0.18em] text-[#7a5b28]">Final score</p>
               <p className="mt-1 font-mono text-4xl font-bold text-[#5c3317]">{scoring.total}</p>
-              <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
+              <div className="mt-3 grid grid-cols-3 gap-3 text-xs">
                 <div>
                   Clock
                   <p className="font-mono text-sm font-semibold">{formatTime(dayStats.seconds)}</p>
@@ -1239,6 +1453,14 @@ Play it: ${playUrl || "/gambit"}`
                   Hearts left
                   <p className="font-mono text-sm font-semibold">
                     {heartsLeft}/{STARTING_HEARTS}
+                  </p>
+                </div>
+                <div>
+                  Daily Gambit ELO
+                  <p className="font-mono text-sm font-semibold">
+                    {dayStats.eloDelta == null
+                      ? "—"
+                      : `${dayStats.eloDelta >= 0 ? "+" : ""}${dayStats.eloDelta}`}
                   </p>
                 </div>
               </div>
@@ -1280,13 +1502,10 @@ Play it: ${playUrl || "/gambit"}`
               {latestUnsolvedKey && (
                 <button
                   type="button"
-                  onClick={() => {
-                    setShowResults(false);
-                    selectDate(latestUnsolvedKey);
-                  }}
-                  className="text-sm text-[#7a5b28]"
+                  onClick={playNextAvailablePuzzle}
+                  className="rounded-sm border border-[#c6a046] bg-[#c6a046] px-4 py-2.5 text-sm font-semibold text-[#2c2419] hover:bg-[#d4b056]"
                 >
-                  Next available day →
+                  Play Next Available Puzzle
                 </button>
               )}
             </div>

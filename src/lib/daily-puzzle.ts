@@ -7,7 +7,9 @@ import {
 
 export const STARTING_HEARTS = 5;
 export const STORAGE_KEY = "daily-gambit-v2";
-export const STORAGE_VERSION = 3;
+export const STORAGE_VERSION = 4;
+export const STARTING_PUZZELO = 1200;
+export const PUZZELO_K = 32;
 export const BASE_POINTS = 1000;
 export const TIME_PENALTY_PER_SEC = 2;
 export const MISTAKE_PENALTY = 150;
@@ -57,12 +59,16 @@ export interface DayProgress {
   mistakes: number;
   completed: boolean;
   board?: BoardSnapshot | null;
+  eloDelta?: number | null;
+  eloAfter?: number | null;
 }
 
 export interface GambitSession {
   version: number;
   lastSelectedKey: string | null;
   days: Record<string, DayProgress>;
+  puzzElo: number;
+  seenPuzzEloIntro: boolean;
 }
 
 export interface ResolvedPuzzle {
@@ -79,11 +85,64 @@ export interface ResolvedPuzzle {
 }
 
 export function emptyProgress(): DayProgress {
-  return { seconds: 0, mistakes: 0, completed: false, board: null };
+  return { seconds: 0, mistakes: 0, completed: false, board: null, eloDelta: null, eloAfter: null };
 }
 
 export function emptySession(): GambitSession {
-  return { version: STORAGE_VERSION, lastSelectedKey: null, days: {} };
+  return {
+    version: STORAGE_VERSION,
+    lastSelectedKey: null,
+    days: {},
+    puzzElo: STARTING_PUZZELO,
+    seenPuzzEloIntro: false,
+  };
+}
+
+export function expectedPuzzleScore(playerElo: number, puzzleRating: number): number {
+  return 1 / (1 + 10 ** ((puzzleRating - playerElo) / 400));
+}
+
+/** 1.0 clean solve; misses and a long clock shrink the win toward 0. */
+export function puzzlePerformance(mistakes: number, seconds: number): number {
+  const miss = Math.min(1, mistakes * 0.2);
+  const timePenalty = Math.min(0.35, Math.max(0, seconds - 20) / 240);
+  return Math.max(0, Math.round((1 - miss - timePenalty) * 1000) / 1000);
+}
+
+export function applyPuzzElo(
+  playerElo: number,
+  puzzleRating: number,
+  mistakes: number,
+  seconds: number,
+): { next: number; delta: number; expected: number; result: number } {
+  const result = puzzlePerformance(mistakes, seconds);
+  const expected = expectedPuzzleScore(playerElo, puzzleRating);
+  const delta = Math.round(PUZZELO_K * (result - expected));
+  return {
+    next: Math.max(100, playerElo + delta),
+    delta,
+    expected,
+    result,
+  };
+}
+
+export function replayPuzzElo(days: Record<string, DayProgress>): {
+  puzzElo: number;
+  days: Record<string, DayProgress>;
+} {
+  const keys = Object.keys(days).sort();
+  let puzzElo = STARTING_PUZZELO;
+  const nextDays = { ...days };
+  for (const key of keys) {
+    const day = nextDays[key];
+    if (!day?.completed) continue;
+    const record = getPuzzleForDate(parseDateKey(key));
+    if (!record) continue;
+    const update = applyPuzzElo(puzzElo, record.rating, day.mistakes, day.seconds);
+    puzzElo = update.next;
+    nextDays[key] = { ...day, eloDelta: update.delta, eloAfter: update.next };
+  }
+  return { puzzElo, days: nextDays };
 }
 
 export function pad2(n: number): string {
@@ -136,6 +195,14 @@ export function uciParts(uci: string): { from: Square; to: Square; promotion?: s
     to: uci.slice(2, 4) as Square,
     promotion: uci.length > 4 ? uci[4] : undefined,
   };
+}
+
+export function normalizeUci(uci: string): string {
+  return uci.toLowerCase();
+}
+
+export function uciMatches(played: string, expected: string): boolean {
+  return normalizeUci(played) === normalizeUci(expected);
 }
 
 function playPgn(pgn: string): Chess {
@@ -275,6 +342,10 @@ function sanitizeBoard(value: unknown): BoardSnapshot | null {
   };
 }
 
+function sanitizeOptionalInt(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? Math.round(value) : null;
+}
+
 function sanitizeDay(value: unknown): DayProgress {
   if (!value || typeof value !== "object") return emptyProgress();
   const seconds = (value as { seconds?: unknown }).seconds;
@@ -285,6 +356,8 @@ function sanitizeDay(value: unknown): DayProgress {
     mistakes: typeof mistakes === "number" && Number.isFinite(mistakes) ? Math.max(0, Math.floor(mistakes)) : 0,
     completed: completed === true,
     board: sanitizeBoard((value as { board?: unknown }).board),
+    eloDelta: sanitizeOptionalInt((value as { eloDelta?: unknown }).eloDelta),
+    eloAfter: sanitizeOptionalInt((value as { eloAfter?: unknown }).eloAfter),
   };
 }
 
@@ -307,18 +380,34 @@ export function loadSession(): GambitSession {
     if (!parsed || typeof parsed !== "object") return emptySession();
 
     const record = parsed as Record<string, unknown>;
-    if (record.version === STORAGE_VERSION && record.days && typeof record.days === "object") {
+    const days = sanitizeDays(record.days ?? parsed);
+    const hasHistory = Object.keys(days).length > 0;
+    const storedElo =
+      typeof record.puzzElo === "number" && Number.isFinite(record.puzzElo)
+        ? Math.max(100, Math.round(record.puzzElo))
+        : null;
+    const storedIntro = record.seenPuzzEloIntro === true;
+    const needsReplay =
+      storedElo === null ||
+      Object.values(days).some((day) => day.completed && day.eloAfter == null);
+    const replayed = needsReplay ? replayPuzzElo(days) : { puzzElo: storedElo ?? STARTING_PUZZELO, days };
+
+    if (typeof record.lastSelectedKey === "string" || record.days) {
       return {
         version: STORAGE_VERSION,
         lastSelectedKey: typeof record.lastSelectedKey === "string" ? record.lastSelectedKey : null,
-        days: sanitizeDays(record.days),
+        days: replayed.days,
+        puzzElo: replayed.puzzElo,
+        seenPuzzEloIntro: storedIntro || hasHistory,
       };
     }
 
     return {
       version: STORAGE_VERSION,
       lastSelectedKey: null,
-      days: sanitizeDays(parsed),
+      days: replayed.days,
+      puzzElo: replayed.puzzElo,
+      seenPuzzEloIntro: hasHistory,
     };
   } catch {
     return emptySession();
@@ -334,6 +423,8 @@ export function saveSession(session: GambitSession): void {
         version: STORAGE_VERSION,
         lastSelectedKey: session.lastSelectedKey,
         days: session.days,
+        puzzElo: session.puzzElo,
+        seenPuzzEloIntro: session.seenPuzzEloIntro,
       } satisfies GambitSession),
     );
   } catch {
