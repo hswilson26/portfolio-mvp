@@ -20,6 +20,8 @@ const THEME_LABELS: Record<string, string> = {
   operaMate: "Opera Mate",
   anastasiaMate: "Anastasia's Mate",
   pillsburysMate: "Pillsbury's Mate",
+  swallowstailMate: "Swallow's Tail Mate",
+  arabianMate: "Arabian Mate",
   backRankMate: "Back-Rank Mate",
   pin: "Pin",
   fork: "Fork",
@@ -113,8 +115,8 @@ export function archiveStartDate(): Date {
 
 export function getArchiveIndex(date: Date): number | null {
   const idx = daysBetween(archiveStartDate(), date);
-  if (idx < 0 || idx >= LICHESS_PUZZLES.length) return null;
-  return idx;
+  if (idx < 0 || LICHESS_PUZZLES.length === 0) return null;
+  return idx % LICHESS_PUZZLES.length;
 }
 
 export function canAccessDate(date: Date, today: Date): boolean {
